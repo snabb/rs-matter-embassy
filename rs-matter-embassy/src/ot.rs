@@ -11,7 +11,7 @@ use embassy_time::{Duration, Instant, Timer};
 
 use openthread::{
     Channels, OpenThread, OtError, OtResources, OtSrpResources, OtUdpResources, RamSettings,
-    RamSettingsChange, SettingsKey, SharedRamSettings, SrpConf, SrpService,
+    RamSettingsChange, SharedRamSettings, SrpConf, SrpService,
 };
 
 use rs_matter_stack::matter::crypto::Crypto;
@@ -567,16 +567,15 @@ where
         Self {
             settings: SharedRamSettings::new(RamSettings::new_with_signal_change(
                 settings_buf,
-                |change| match change {
-                    RamSettingsChange::Added { key, .. }
-                    | RamSettingsChange::Removed { key, .. }
-                        if key == SettingsKey::SrpEcdsaKey as u16 =>
-                    {
-                        true
-                    }
-                    RamSettingsChange::Clear => true,
-                    _ => false,
-                },
+                // Persist ALL OpenThread settings, not just the SRP key. Per
+                // OpenThread's otPlatSettings contract the platform must persist every
+                // key OT writes. Dropping NetworkInfo (MLE/MAC frame counters and the
+                // key-sequence counter), the active dataset and the SLAAC IID secret
+                // means each reboot resets the security counters (which can cause MLE
+                // "Security" processing failures) and changes the IPv6 address (the IID
+                // secret is regenerated). OpenThread batches frame-counter writes, so
+                // persisting everything is not unduly write-heavy.
+                |_change| true,
             )),
             store,
         }
@@ -594,17 +593,23 @@ where
         self.store.access(|kv, buf| {
             if let Some(data) = kv.load(OT_SRP_ECDSA_KEY, buf)? {
                 self.settings.with(|settings| {
+                    // Each entry is [key: u16-le][len: u16-le][value: len bytes].
                     let mut offset = 0;
 
-                    while offset < data.len() {
+                    while offset + 4 <= data.len() {
                         let key = u16::from_le_bytes([data[offset], data[offset + 1]]);
-                        offset += 2;
+                        let len =
+                            u16::from_le_bytes([data[offset + 2], data[offset + 3]]) as usize;
+                        offset += 4;
 
-                        let value = &data[offset..];
+                        if offset + len > data.len() {
+                            break;
+                        }
 
+                        let value = &data[offset..offset + len];
                         unwrap!(settings.add(key, value));
 
-                        offset += value.len();
+                        offset += len;
                     }
                 });
             }
@@ -619,13 +624,14 @@ where
             let offset = self.settings.with(|settings| {
                 let mut offset = 0;
 
-                for (key, value) in settings
-                    .iter()
-                    .filter(|(key, _)| *key == SettingsKey::SrpEcdsaKey as u16)
-                {
-                    assert!(value.len() + 2 <= buf.len() - offset);
+                for (key, value) in settings.iter() {
+                    // [key: u16-le][len: u16-le][value]
+                    assert!(offset + 4 + value.len() <= buf.len());
 
                     buf[offset..offset + 2].copy_from_slice(&key.to_le_bytes());
+                    offset += 2;
+
+                    buf[offset..offset + 2].copy_from_slice(&(value.len() as u16).to_le_bytes());
                     offset += 2;
 
                     buf[offset..offset + value.len()].copy_from_slice(value);
