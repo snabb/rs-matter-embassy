@@ -546,6 +546,17 @@ impl Mdns for OtMdns<'_, '_> {
 /// in the SRP server.
 const OT_SRP_ECDSA_KEY: u16 = VENDOR_KEYS_START;
 
+/// Magic header prefixed to the persisted settings blob.
+///
+/// It distinguishes the current `[magic][ {key}{len}{value} ... ]` layout from
+/// the layout written by earlier firmware - a single `[key][value]` entry that
+/// held only the SRP ECDSA key. A blob without the magic is therefore read back
+/// as that one legacy entry, so an in-place firmware upgrade preserves the
+/// stored key instead of misparsing it; the blob is rewritten in the current
+/// format on the next store. The first bytes cannot collide with a legacy blob,
+/// whose leading `u16` is a small OpenThread settings key.
+const OT_SETTINGS_MAGIC: [u8; 4] = *b"OTS1";
+
 /// A struct for implementing persistance of `openthread` settings - volatitle and
 /// non-volatile (for selected keys)
 pub struct OtPersist<'a, 'd, S, T> {
@@ -593,23 +604,31 @@ where
         self.store.access(|kv, buf| {
             if let Some(data) = kv.load(OT_SRP_ECDSA_KEY, buf)? {
                 self.settings.with(|settings| {
-                    // Each entry is [key: u16-le][len: u16-le][value: len bytes].
-                    let mut offset = 0;
+                    if data.starts_with(&OT_SETTINGS_MAGIC) {
+                        // Current format: [magic][ {key: u16-le}{len: u16-le}{value} ... ].
+                        let entries = &data[OT_SETTINGS_MAGIC.len()..];
+                        let mut offset = 0;
 
-                    while offset + 4 <= data.len() {
-                        let key = u16::from_le_bytes([data[offset], data[offset + 1]]);
-                        let len =
-                            u16::from_le_bytes([data[offset + 2], data[offset + 3]]) as usize;
-                        offset += 4;
+                        while offset + 4 <= entries.len() {
+                            let key = u16::from_le_bytes([entries[offset], entries[offset + 1]]);
+                            let len = u16::from_le_bytes([entries[offset + 2], entries[offset + 3]])
+                                as usize;
+                            offset += 4;
 
-                        if offset + len > data.len() {
-                            break;
+                            if offset + len > entries.len() {
+                                break;
+                            }
+
+                            unwrap!(settings.add(key, &entries[offset..offset + len]));
+
+                            offset += len;
                         }
-
-                        let value = &data[offset..offset + len];
-                        unwrap!(settings.add(key, value));
-
-                        offset += len;
+                    } else if data.len() >= 2 {
+                        // Legacy format from earlier firmware: a single [key: u16-le][value]
+                        // entry holding the SRP ECDSA key. Preserve it so the upgrade keeps
+                        // the SRP identity; it is rewritten with the magic on the next store.
+                        let key = u16::from_le_bytes([data[0], data[1]]);
+                        unwrap!(settings.add(key, &data[2..]));
                     }
                 });
             }
@@ -622,7 +641,8 @@ where
     pub fn store(&self) -> Result<(), Error> {
         self.store.access(|kv, buf| {
             let offset = self.settings.with(|settings| {
-                let mut offset = 0;
+                buf[..OT_SETTINGS_MAGIC.len()].copy_from_slice(&OT_SETTINGS_MAGIC);
+                let mut offset = OT_SETTINGS_MAGIC.len();
 
                 for (key, value) in settings.iter() {
                     // [key: u16-le][len: u16-le][value]
