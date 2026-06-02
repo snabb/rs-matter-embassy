@@ -420,6 +420,22 @@ impl ThreadDiag for OtNetCtl<'_> {
     ) -> Result<(), Error> {
         Ok(())
     }
+
+    fn tx_total_count(&self) -> Result<Option<u32>, Error> {
+        Ok(Some(self.0.link_counters().tx_total))
+    }
+
+    fn tx_retry_count(&self) -> Result<Option<u32>, Error> {
+        Ok(Some(self.0.link_counters().tx_retry))
+    }
+
+    fn tx_err_cca_count(&self) -> Result<Option<u32>, Error> {
+        Ok(Some(self.0.link_counters().tx_err_cca))
+    }
+
+    fn tx_err_busy_channel_count(&self) -> Result<Option<u32>, Error> {
+        Ok(Some(self.0.link_counters().tx_err_busy_channel))
+    }
 }
 
 /// An mDNS trait implementation for `openthread` using Thread SRP
